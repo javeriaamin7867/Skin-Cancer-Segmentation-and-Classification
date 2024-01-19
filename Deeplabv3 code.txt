@@ -1,0 +1,138 @@
+from IPython.display import clear_output as cls
+!pip install tf_explain
+cls()
+
+import os
+import keras
+import numpy as np
+from glob import glob
+from tqdm import tqdm
+import tensorflow as tf
+
+# Data Loading
+import tensorflow.data as tfd
+import tensorflow.image as tfi
+from tensorflow.keras.utils import load_img, img_to_array
+
+# Data Visualization
+import matplotlib.pyplot as plt
+
+# Models 
+from keras.layers import ReLU
+from keras.layers import Layer
+from keras.layers import Input
+from keras.layers import Conv2D
+from keras.layers import Concatenate
+from keras.layers import UpSampling2D
+from keras.layers import AveragePooling2D
+from keras.models import Sequential, Model
+from keras.layers import BatchNormalization
+def load_image(path, IMAGE_SIZE):
+    image = img_to_array(load_img(path))
+    image = tfi.resize(image, (IMAGE_SIZE, IMAGE_SIZE))
+    image = tf.cast(image, tf.float32)
+    image = image/255.
+    return image
+
+def load_data(image_paths, trim=None, IMAGE_SIZE=256, BATCH_SIZE=8, files=False):
+    
+    # Collect Paths
+    if trim is not None:
+        image_paths = image_paths[:trim]
+    
+    mask_paths = []
+    for path in image_paths:
+        mask_path = path.replace(".png", "_mask.png")
+        mask_paths.append(mask_path)
+ images, masks = np.zeros(shape=(len(image_paths), IMAGE_SIZE, IMAGE_SIZE, 3)), np.zeros(shape=(len(image_paths), IMAGE_SIZE, IMAGE_SIZE, 3))
+    
+    # Load Images
+    for i, (image_path, mask_path) in tqdm(enumerate(zip(image_paths, mask_paths)), desc="Loading"):
+        image = load_image(image_path, IMAGE_SIZE=IMAGE_SIZE)
+        mask  = load_image(mask_path, IMAGE_SIZE=IMAGE_SIZE)
+        images[i] = image
+        masks[i] = mask
+    
+    # Dataset
+    data = tfd.Dataset.from_tensor_slices((images, masks))
+    data = data.shuffle(1000).batch(BATCH_SIZE, drop_remainder=True)
+    data = data.prefetch(tfd.AUTOTUNE)
+    
+    if files:
+        return data, images, masks
+    return data
+train_ds = load_data(image_paths, trim=200)
+valid_ds, val_images, val_masks = load_data(image_paths, trim=10, files=True)
+class ConvBlock(Layer):
+    
+    def __init__(self, filters=256, kernel_size=3, use_bias=False, dilation_rate=1, **kwargs):
+        super(ConvBlock, self).__init__(**kwargs)
+        
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.use_bias = use_bias
+        self.dilation_rate = dilation_rate
+        
+        self.net = Sequential([
+            Conv2D(filters, kernel_size=kernel_size, strides=1, padding='same', dilation_rate=dilation_rate, use_bias=use_bias, kernel_initializer='he_normal'),
+            BatchNormalization(),
+            ReLU()
+        ])
+    
+    def call(self, X): return self.net(X)        
+        
+    def get_config(self):
+        base_config = super().get_config()
+        return {
+            **base_config,
+            "filters":self.filters,
+            "kernel_size":self.kernel_size,
+            "use_bias":self.use_bias,
+            "dilation_rate":self.dilation_rate
+        }
+def AtrousSpatialPyramidPooling(X):
+    
+    # Shapes 
+    _, height, width, _ = X.shape
+    
+    # Image Pooling 
+    image_pool = AveragePooling2D(pool_size=(height, width), name="ASPP-AvgPool2D")(X)
+    image_pool = ConvBlock(kernel_size=1, name="ASPP-ConvBlock-1")(image_pool)
+    image_pool = UpSampling2D(size=(height//image_pool.shape[1], width//image_pool.shape[2]), name="ASPP-UpSampling")(image_pool)
+    
+    # Conv Blocks
+    conv_1 = ConvBlock(kernel_size=1, dilation_rate=1, name="ASPP-Conv-1")(X)
+    conv_6 = ConvBlock(kernel_size=3, dilation_rate=6, name="ASPP-Conv-6")(X)
+    conv_12 = ConvBlock(kernel_size=3, dilation_rate=12, name="ASPP-Conv-12")(X)
+    conv_18 = ConvBlock(kernel_size=3, dilation_rate=18, name="ASPP-Conv-18")(X)
+    
+    # Concat All
+    concat = Concatenate(axis=-1, name="ASPP-Concat")([image_pool, conv_1, conv_6, conv_12, conv_18])
+    net = ConvBlock(kernel_size=1, name="ASPP-Net")(concat)
+    
+    return net
+# PARAM
+LR = 1e-3
+IMAGE_SIZE = 256
+
+# Input
+InputL = Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name="InputLayer")
+
+ASPP = AtrousSpatialPyramidPooling(DCNN)
+ASPP = UpSampling2D(size=(IMAGE_SIZE//4//ASPP.shape[1], IMAGE_SIZE//4//ASPP.shape[2]), name="AtrousSpatial")(ASPP)
+
+# LLF Phase
+LLF = ConvBlock(filters=48, kernel_size=1, name="LLF-ConvBlock")(LLF)
+
+# Combined
+combined = Concatenate(axis=-1, name="Combine-LLF-ASPP")([ASPP, LLF])
+features = ConvBlock(name="Top-ConvBlock-1")(combined)
+features = ConvBlock(name="Top-ConvBlock-2")(features)
+upsample = UpSampling2D(size=(IMAGE_SIZE//features.shape[1], IMAGE_SIZE//features.shape[1]), interpolation='bilinear', name="Top-UpSample")(features)
+
+# Output Mask
+PredMask = Conv2D(3, kernel_size=3, strides=1, padding='same', activation='sigmoid', use_bias=False, name="OutputMask")(upsample)
+
+# DeelLabV3+ Model
+model = Model(InputL, PredMask, name="DeepLabV3-Plus")
+model.summary()
